@@ -1,9 +1,10 @@
 import { asyncHandler } from "../utils/asyncHandler.js";
 import {ApiError} from "../utils/ApiError.js"
 import { User} from "../models/user.model.js"
-// import {uploadOnCloudinary} from "../utils/cloudinary.js"
 import { ApiResponse } from "../utils/ApiResponse.js";
 import jwt from "jsonwebtoken"
+import {uploadOnCloudinary,deleteCloudinaryImage} from "../utils/cloudinary.js"
+// import {upload} from "../middlewares/multer.middleware.js"
 // import mongoose from "mongoose";
 
 
@@ -24,15 +25,60 @@ const generateAccessAndRefereshTokens = async(userId) =>{
     }
 }
 
+const refreshAccessToken = asyncHandler(async (req, res) => {
+    const incomingRefreshToken = req.cookies.refreshToken || req.body.refreshToken
 
-// Email regex pattern
-const emailRegex = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
+    if (!incomingRefreshToken) {
+        throw new ApiError(401, "unauthorized request")
+    }
 
-// Password regex (At least 8 characters, At most 12 characters, 1 uppercase, 1 lowercase, 1 number, 1 special character)
-const passwordRegex = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{8,12}$/;
+    try {
+        const decodedToken = jwt.verify(
+            incomingRefreshToken,
+            process.env.REFRESH_TOKEN_SECRET
+        )
+    
+        const user = await User.findById(decodedToken?._id)
+    
+        if (!user) {
+            throw new ApiError(401, "Invalid refresh token")
+        }
+    
+        if (incomingRefreshToken !== user?.refreshToken) {
+            throw new ApiError(401, "Refresh token is expired or used")
+            
+        }
+    
+        const options = {
+            httpOnly: true,
+            secure: true
+        }
+    
+        const {accessToken, newRefreshToken} = await generateAccessAndRefereshTokens(user._id)
+    
+        return res
+        .status(200)
+        .cookie("accessToken", accessToken, options)
+        .cookie("refreshToken", newRefreshToken, options)
+        .json(
+            new ApiResponse(
+                200, 
+                {accessToken, refreshToken: newRefreshToken},
+                "Access token refreshed"
+            )
+        )
+    } catch (error) {
+        throw new ApiError(401, error?.message || "Invalid refresh token")
+    }
 
+})
 
 const registerUser = asyncHandler(async(req, res) => {
+
+    // Email regex pattern
+    const emailRegex = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
+    // Password regex (At least 8 characters, At most 12 characters, 1 uppercase, 1 lowercase, 1 number, 1 special character)
+    const passwordRegex = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{8,12}$/;
 
     const {fullName, email, contact, password, role = "user"} = req.body
     // console.log("email: ", email);
@@ -93,7 +139,6 @@ const registerUser = asyncHandler(async(req, res) => {
 
 })
 
-
 const loginUser = asyncHandler(async (req, res) =>{
 
     const {email, contact, password} = req.body
@@ -142,7 +187,6 @@ const loginUser = asyncHandler(async (req, res) =>{
 
 })
 
-
 const logoutUser = asyncHandler(async(req, res) => {
     await User.findByIdAndUpdate(
         req.user._id,
@@ -168,54 +212,58 @@ const logoutUser = asyncHandler(async(req, res) => {
     .json(new ApiResponse(200, {}, "User logged Out"))
 })
 
-
-const refreshAccessToken = asyncHandler(async (req, res) => {
-    const incomingRefreshToken = req.cookies.refreshToken || req.body.refreshToken
-
-    if (!incomingRefreshToken) {
-        throw new ApiError(401, "unauthorized request")
-    }
-
+const uploadAvatar = asyncHandler(async (req, res) => {
     try {
-        const decodedToken = jwt.verify(
-            incomingRefreshToken,
-            process.env.REFRESH_TOKEN_SECRET
-        )
-    
-        const user = await User.findById(decodedToken?._id)
-    
-        if (!user) {
-            throw new ApiError(401, "Invalid refresh token")
-        }
-    
-        if (incomingRefreshToken !== user?.refreshToken) {
-            throw new ApiError(401, "Refresh token is expired or used")
-            
-        }
-    
-        const options = {
-            httpOnly: true,
-            secure: true
-        }
-    
-        const {accessToken, newRefreshToken} = await generateAccessAndRefereshTokens(user._id)
-    
-        return res
-        .status(200)
-        .cookie("accessToken", accessToken, options)
-        .cookie("refreshToken", newRefreshToken, options)
-        .json(
-            new ApiResponse(
-                200, 
-                {accessToken, refreshToken: newRefreshToken},
-                "Access token refreshed"
-            )
-        )
-    } catch (error) {
-        throw new ApiError(401, error?.message || "Invalid refresh token")
-    }
+        // Get the user from the JWT token (assuming `req.user` contains user ID)
+        const userId = req.user.id;
 
-})
+        // Validate user existence
+        const user = await User.findById(userId);
+        if (!user) {
+            return res.status(404).json({ error: "User not found" });
+        }
+
+        // Validate file
+        if (!req.file) {
+            return res.status(400).json({ error: "No file uploaded" });
+        }
+
+        const localFilePath = req.file.path; // Get the temp file path
+
+        // If the user already has an avatar, delete the old one before uploading a new one
+        if (user.avatar) {
+            // Extract public ID from Cloudinary URL
+            const publicId = user.avatar.split("/").pop().split(".")[0]; 
+            console.log("Public ID extracted:", publicId);
+
+            // Delete the existing image from Cloudinary
+            await deleteCloudinaryImage(publicId);
+        }
+
+        // Upload new avatar to Cloudinary (store in trip-planner/profile/)
+        const uploadResult = await uploadOnCloudinary(localFilePath, "Profile");
+
+        if (!uploadResult) {
+            return res.status(500).json({ error: "Image upload failed" });
+        }
+
+        // Update user avatar field with the new Cloudinary URL
+        user.avatar = uploadResult.secure_url;
+        await user.save();
+
+        return res.json({
+            message: "Avatar updated successfully",
+            avatarUrl: uploadResult.secure_url
+        });
+
+    } catch (error) {
+        console.error("Error uploading avatar:", error);
+        res.status(500).json({ error: "Server error" });
+    }
+});
+
+
+
 
 
 
@@ -225,4 +273,5 @@ export {
     loginUser,
     logoutUser,
     refreshAccessToken,
+    uploadAvatar
 }
